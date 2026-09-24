@@ -1,0 +1,13 @@
+*.pyc
+sru*
+/embedding
+.vscode
+data/
+outputs/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.tmp
+__pycache__/
+.pytest_cache/
+.smoke*/

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsmbind-tcr-pmhc"
+version = "0.1.0"
+description = "DSMBind with a scalable TCR-pMHC fine-tuning pipeline"
+requires-python = ">=3.9,<3.11"
+dependencies = [
+  "numpy<2",
+  "scipy",
+  "tqdm",
+  "fair-esm==2.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["bindenergy*"]
+

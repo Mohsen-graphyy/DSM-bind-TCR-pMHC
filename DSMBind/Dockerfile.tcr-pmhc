@@ -1,0 +1,21 @@
+FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-devel
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/DSMBind
+COPY requirements-tcr-pmhc.txt pyproject.toml ./
+RUN pip install -r requirements-tcr-pmhc.txt \
+    && git clone https://github.com/asappresearch/sru.git /opt/sru \
+    && cd /opt/sru \
+    && git checkout --detach c2d44e62b90115db59ab92ccea4b2e5b77077cf9 \
+    && pip install .
+
+COPY . .
+RUN pip install -e . --no-deps
+
+CMD ["bash"]
