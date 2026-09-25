@@ -2,7 +2,7 @@
 sru*
 /embedding
 .vscode
-data/
+/data/
 outputs/
 *.sqlite
 *.sqlite-shm
