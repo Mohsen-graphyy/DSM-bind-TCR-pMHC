@@ -34,11 +34,11 @@ FULL_ARGS=(
   --embeddings "${FULL_ESM}"
   --init-checkpoint DSMBind/ckpts/model.skempi.allatom
   --output-dir "${FULL_OUTPUT}" --recurrence-backend reference --device cuda
-  --batch-size 1 --learning-rate "${LEARNING_RATE:-1e-6}"
+  --batch-size "${BATCH_SIZE:-1}" --learning-rate "${LEARNING_RATE:-1e-6}"
   --epochs "${EPOCHS:-3}" --patience 0 --anneal-rate 1.0
   --validation-batches "${VALIDATION_BATCHES:-512}"
   --validate-every-batches "${VALIDATE_EVERY_BATCHES:-2000}"
-  --checkpoint-every-batches 500 --seed 7
+  --checkpoint-every-batches "${CHECKPOINT_EVERY_BATCHES:-500}" --seed 7
 )
 if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
   FULL_ARGS+=(--resume "${RESUME_CHECKPOINT}")

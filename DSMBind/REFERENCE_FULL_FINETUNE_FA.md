@@ -55,6 +55,21 @@ ESM_CACHE=/absolute/path/to/existing.sqlite bash scripts/train_reference_full.sh
 
 ## ۴. مشاهده روند و ادامه پس از قطع
 
+### اگر batch=1 برای مهلت شما کند است
+
+با Ctrl+C اجرای قبلی را متوقف کنید. امبدینگ‌های تکمیل‌شده حفظ می‌شوند. با batch=4 و یک epoch، همه ۱۳۷٬۸۶۳ pair استفاده می‌شوند، در ۳۴٬۴۶۶ گام optimizer. سرعت واقعی و حافظه روی GPU باید سنجیده شوند؛ افزایش batch تضمین سرعت چهاربرابری نیست. این اجرای تازه است؛ از checkpoint قبلی با batch متفاوت resume نکنید.
+
+```bash
+BATCH_SIZE=4 EPOCHS=1 VALIDATION_BATCHES=128 \
+VALIDATE_EVERY_BATCHES=500 CHECKPOINT_EVERY_BATCHES=100 \
+TRAINING_OUTPUT=outputs/reference_full_b4_01 \
+bash scripts/train_reference_full.sh
+```
+
+۱۲۸ batch اعتبارسنجی در این حالت همان ۵۱۲ pair است. بعد از حدود ۵۰ batch، زمان هر batch و ETA را بررسی کنید. در صورت کمبود حافظه، از batch=2، VALIDATION_BATCHES=256 و پوشه خروجی جدید استفاده کنید. هر مقایسه baseline با وزن آموزش‌دیده در همین تنظیمات دوباره محاسبه می‌شود. batch بزرگ‌تر تعداد update را در هر گذر کم می‌کند؛ نتیجه عددی با batch=1 یکسان نیست.
+
+برای ادامه همین اجرای batch=4 بعد از قطع، همان متغیرهای بالا را به‌همراه `RESUME_CHECKPOINT=outputs/reference_full_b4_01/last.pt` استفاده کنید.
+
 در ترمینال دوم سرور:
 
 ```bash
