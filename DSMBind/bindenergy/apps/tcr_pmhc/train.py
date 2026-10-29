@@ -41,6 +41,8 @@ def parse_args() -> argparse.Namespace:
         help="Write last.pt during an epoch; 0 disables mid-epoch checkpoints",
     )
     parser.add_argument("--validation-batches", type=int, default=200)
+    parser.add_argument("--validate-every-batches", type=int, default=0,
+                        help="Also validate/select best within each epoch; 0 means epoch boundaries only")
     parser.add_argument("--test-batches", type=int, default=0, help="0 means all test batches")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--num-threads", type=int, default=8)
@@ -229,8 +231,8 @@ def main() -> int:
         raise RuntimeError("CUDA was requested but is not available")
     if args.batch_size <= 0 or args.epochs <= 0:
         raise ValueError("batch-size and epochs must be positive")
-    if args.checkpoint_every_batches < 0:
-        raise ValueError("checkpoint-every-batches must be non-negative")
+    if args.checkpoint_every_batches < 0 or args.validate_every_batches < 0:
+        raise ValueError("Checkpoint and validation intervals must be non-negative")
     device = torch.device(args.device)
     torch.set_num_threads(args.num_threads)
     set_seed(args.seed)
@@ -265,6 +267,8 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
     resume_running_loss = 0.0
     resume_seen_batches = 0
     saved_rng_state: dict[str, Any] | None = None
+    validation_history = []
+    best_selection = None
     if args.resume:
         if not isinstance(source_checkpoint, dict):
             raise ValueError("--resume requires a checkpoint created by this training script")
@@ -272,7 +276,7 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
         saved_backend = saved_config.get("recurrence_backend", "native")
         if saved_backend != args.recurrence_backend:
             raise ValueError("Cannot resume optimizer across recurrence backends; start afresh from the original pretrained checkpoint")
-        for key in ("batch_size", "max_train_pairs", "no_sidechain", "seed", "validation_batches"):
+        for key in ("batch_size", "max_train_pairs", "no_sidechain", "seed", "validation_batches", "validate_every_batches"):
             if key in saved_config and saved_config[key] != getattr(args, key):
                 raise ValueError(
                     f"Cannot change {key} when resuming: checkpoint has "
@@ -283,6 +287,8 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
         best_validation = float(source_checkpoint.get("best_validation_loss", float("inf")))
         stale_epochs = int(source_checkpoint.get("stale_epochs", 0))
         history = list(source_checkpoint.get("history", []))
+        validation_history = list(source_checkpoint.get("validation_history", []))
+        best_selection = source_checkpoint.get("best_selection")
         if "training_state" in source_checkpoint:
             training_state = source_checkpoint["training_state"]
             start_epoch = int(training_state["epoch"])
@@ -331,6 +337,11 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
             best_validation = evaluate_loss(model, validation_data, embeddings, device, args.batch_size,
                 args.validation_batches, not args.no_sidechain, args.seed + 100_000, details=baseline)
             baseline["init_checkpoint_sha256"] = digest_file(args.init_checkpoint)
+        dataset_hashes = {key: digest_file(path) for key, path in
+                          (("train", args.train_db), ("validation", args.validation_db))}
+        if args.resume and baseline.get("dataset_sha256", dataset_hashes) != dataset_hashes:
+            raise ValueError("Resume requires unchanged train and validation databases")
+        baseline["dataset_sha256"] = dataset_hashes
         write_json(args.output_dir / "training_config.json", {
             key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()})
         write_json(args.output_dir / "baseline_validation.json", baseline)
@@ -342,6 +353,8 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
             initial_payload = make_checkpoint(model, optimizer, scheduler, architecture, args, best_validation,
                 0, [], {"epoch": 0, "indices": None, "next_position": 0, "running_loss": 0., "seen_batches": 0})
             initial_payload["baseline_validation"] = baseline
+            initial_payload["best_selection"] = None
+            initial_payload["validation_history"] = []
             atomic_torch_save(initial_payload, args.output_dir / "best.pt")
             del initial_payload
         gradient_checks = []
@@ -391,10 +404,29 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
                 seen_batches += 1
                 next_position += len(batch)
                 progress.set_postfix(loss=f"{running_loss / seen_batches:.4f}")
+                validation_interval = getattr(args, "validate_every_batches", 0)
+                intermediate_validation = bool(validation_interval and
+                    seen_batches % validation_interval == 0 and next_position < len(indices))
+                intermediate_improved = False
+                if intermediate_validation:
+                    diagnostics = {}
+                    current_loss = evaluate_loss(model, validation_data, embeddings, device,
+                        args.batch_size, args.validation_batches, not args.no_sidechain,
+                        args.seed + 100_000, details=diagnostics)
+                    record = {"epoch": epoch, "batch": seen_batches, "validation_loss": current_loss,
+                              "kind": "within_epoch", "diagnostics": diagnostics}
+                    validation_history.append(record)
+                    intermediate_improved = current_loss < best_validation
+                    if intermediate_improved:
+                        best_validation = current_loss
+                        best_selection = {k: record[k] for k in ("epoch", "batch", "kind", "validation_loss")}
+                    write_json(args.output_dir / "validation_history.json", validation_history)
+                    print(f"validation epoch={epoch + 1} batch={seen_batches} loss={current_loss:.8f} best={best_validation:.8f}", flush=True)
+                    model.train()
                 if (
-                    args.checkpoint_every_batches
+                    intermediate_validation or (args.checkpoint_every_batches
                     and seen_batches % args.checkpoint_every_batches == 0
-                    and next_position < len(indices)
+                    and next_position < len(indices))
                 ):
                     training_state = {
                         "epoch": epoch,
@@ -408,7 +440,11 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
                             best_validation, stale_epochs, history, training_state,
                         )
                     mid_payload["baseline_validation"] = baseline
+                    mid_payload["best_selection"] = best_selection
+                    mid_payload["validation_history"] = validation_history
                     atomic_torch_save(mid_payload, args.output_dir / "last.pt")
+                    if intermediate_improved:
+                        atomic_torch_save(mid_payload, args.output_dir / "best.pt")
                     del mid_payload
 
             validation_details = {}
@@ -424,6 +460,10 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
                 details=validation_details,
             )
             write_json(args.output_dir / f"validation_epoch_{epoch + 1}.json", validation_details)
+            validation_record = {"epoch": epoch, "batch": seen_batches, "validation_loss": validation_loss,
+                                 "kind": "epoch_end", "diagnostics": validation_details}
+            validation_history.append(validation_record)
+            write_json(args.output_dir / "validation_history.json", validation_history)
             scheduler.step()
             train_loss = running_loss / max(seen_batches, 1)
             history.append(
@@ -437,6 +477,7 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
             improved = validation_loss < best_validation
             if improved:
                 best_validation = validation_loss
+                best_selection = {k: validation_record[k] for k in ("epoch", "batch", "kind", "validation_loss")}
                 stale_epochs = 0
             else:
                 stale_epochs += 1
@@ -452,6 +493,8 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
                 best_validation, stale_epochs, history, training_state,
             )
             payload["baseline_validation"] = baseline
+            payload["best_selection"] = best_selection
+            payload["validation_history"] = validation_history
             atomic_torch_save(payload, args.output_dir / "last.pt")
             if improved:
                 atomic_torch_save(payload, args.output_dir / "best.pt")
@@ -474,7 +517,8 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
                         for name, value in initial_heads.items()}
         report = {"best_validation_loss": best_validation, "epochs_completed": len(history),
                   "baseline_validation_loss": baseline["loss"], "baseline_zero_force_loss": baseline["zero_force_loss"],
-                  "best_checkpoint_is_initial": not bool(best_checkpoint["history"]),
+                  "best_checkpoint_is_initial": not bool(best_checkpoint.get("best_selection") or best_checkpoint["history"]),
+                  "best_selection": best_checkpoint.get("best_selection"),
                   "best_head_max_abs_updates": head_updates, "last_head_max_abs_updates": last_updates,
                   "recurrence_backend": args.recurrence_backend}
         write_json(args.output_dir / "head_updates.json", {"best": head_updates, "last": last_updates})

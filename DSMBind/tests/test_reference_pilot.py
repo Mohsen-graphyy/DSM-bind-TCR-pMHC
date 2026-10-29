@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from contextlib import nullcontext
 from unittest.mock import patch
 from argparse import Namespace
 from pathlib import Path
@@ -47,8 +48,8 @@ class ReferencePilotTests(unittest.TestCase):
                 pass
             def close(self):
                 pass
-        for learning_rate in (0., .001):
-            with self.subTest(learning_rate=learning_rate), tempfile.TemporaryDirectory() as directory:
+        for learning_rate, intermediate_only in ((0., False), (.001, False), (.001, True)):
+            with self.subTest(learning_rate=learning_rate, intermediate_only=intermediate_only), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 model = ToyEnergy()
                 with torch.no_grad():
@@ -58,15 +59,24 @@ class ReferencePilotTests(unittest.TestCase):
                 checkpoint = (model.state_dict(), {}, architecture)
                 init = root / 'original.pt'
                 torch.save(checkpoint, init)
+                (root / 'train.sqlite').write_bytes(b'train fixture')
+                (root / 'validation.sqlite').write_bytes(b'validation fixture')
                 args = Namespace(learning_rate=learning_rate, anneal_rate=1., resume=None,
-                    train_db=Path('train.sqlite'), validation_db=Path('validation.sqlite'), test_db=None,
+                    train_db=root / 'train.sqlite', validation_db=root / 'validation.sqlite', test_db=None,
                     embeddings=Path('embeddings.sqlite'), chain_cache_size=1, embedding_cache_size=1,
                     batch_size=1, epochs=1, patience=0, seed=7, validation_batches=0, test_batches=0,
                     no_sidechain=False, max_train_pairs=None, clip_norm=1., checkpoint_every_batches=1,
-                    output_dir=root, init_checkpoint=init, recurrence_backend='reference')
+                    output_dir=root, init_checkpoint=init, recurrence_backend='reference', validate_every_batches=1)
+                evaluations = iter((2., 1.5, 2.5))
+                def controlled_validation(*positional, **keywords):
+                    value = next(evaluations)
+                    details = keywords.get('details', positional[9] if len(positional) > 9 else None)
+                    details.update(loss=value, zero_force_loss=1.)
+                    return value
                 with patch('bindenergy.apps.tcr_pmhc.train.TCRpMHCPairDataset', Dataset), \
                      patch('bindenergy.apps.tcr_pmhc.train.EmbeddingStore', Embeddings), \
-                     patch('bindenergy.apps.tcr_pmhc.train.make_model_batch', return_value=(None, None)):
+                     patch('bindenergy.apps.tcr_pmhc.train.make_model_batch', return_value=(None, None)), \
+                     (patch('bindenergy.apps.tcr_pmhc.train.evaluate_loss', side_effect=controlled_validation) if intermediate_only else nullcontext()):
                     self.assertEqual(train_model(args, model, architecture, checkpoint, torch.device('cpu')), 0)
                 report = json.loads((root / 'final_metrics.json').read_text())
                 self.assertEqual(report['best_checkpoint_is_initial'], learning_rate == 0)
@@ -75,6 +85,26 @@ class ReferencePilotTests(unittest.TestCase):
                 if learning_rate:
                     self.assertLess(report['best_validation_loss'], report['baseline_validation_loss'])
                     self.assertTrue(all(value > 0 for value in report['best_head_max_abs_updates'].values()))
+                if intermediate_only:
+                    from bindenergy.apps.tcr_pmhc.train import torch_load
+                    best = torch_load(root / 'best.pt', torch.device('cpu'))
+                    self.assertEqual(best['history'], [])
+                    self.assertEqual(report['best_selection']['kind'], 'within_epoch')
+                    self.assertEqual(best['training_state']['next_position'], 1)
+                    self.assertEqual(len(json.loads((root / 'validation_history.json').read_text())), 2)
+                    uninterrupted = torch_load(root / 'last.pt', torch.device('cpu'))
+                    resumed_model = ToyEnergy()
+                    resumed_model.load_state_dict(best['model_state'])
+                    args.resume = root / 'best.pt'
+                    evaluations = iter((2.5,))
+                    with patch('bindenergy.apps.tcr_pmhc.train.TCRpMHCPairDataset', Dataset), \
+                         patch('bindenergy.apps.tcr_pmhc.train.EmbeddingStore', Embeddings), \
+                         patch('bindenergy.apps.tcr_pmhc.train.make_model_batch', return_value=(None, None)), \
+                         patch('bindenergy.apps.tcr_pmhc.train.evaluate_loss', side_effect=controlled_validation):
+                        train_model(args, resumed_model, architecture, best, torch.device('cpu'))
+                    resumed = torch_load(root / 'last.pt', torch.device('cpu'))
+                    for name, value in uninterrupted['model_state'].items():
+                        self.assertTrue(torch.equal(value, resumed['model_state'][name]), name)
 
     def test_energy_head_guard_detects_missing_and_nonfinite_gradients(self):
         model = torch.nn.Module()
