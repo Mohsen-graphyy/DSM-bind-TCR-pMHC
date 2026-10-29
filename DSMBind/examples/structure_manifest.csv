@@ -1,0 +1,2 @@
+observation_id,pdb_path,chain_map,peptide,delta_g_kcal_mol,tcr_id,strict_group_id
+example_001,pdbs/example.pdb,"{""D"":""B"",""E"":""A"",""A"":""M"",""C"":""P""}",GILGFVFTL,-7.2,example_TCR,GILGFVFTL|HLA-A*02:01|study|298.15|SPR

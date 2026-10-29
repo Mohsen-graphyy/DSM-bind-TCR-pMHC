@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import zlib
 from collections import OrderedDict
@@ -68,12 +69,17 @@ def _decode_array(blob: bytes, dtype: np.dtype, shape: Sequence[int]) -> np.ndar
 def parse_pdb_chains(
     pdb_path: str | Path,
     wanted_chains: Iterable[str] = STANDARD_CHAINS,
+    required_backbone_atoms: Sequence[str] = ("N", "CA", "C"),
+    allow_whitespace_records: bool = False,
 ) -> dict[str, ChainRecord]:
     """Parse canonical ATOM records into DSMBind's residue atom14 layout.
 
     Alternative locations are resolved by highest occupancy, with blank/A
     locations preferred when occupancies tie.  A residue must contain N, CA,
-    and C; incomplete side chains are represented by zero coordinates.
+    and C by default; inference callers may explicitly require only CA and
+    retain zero coordinates for other missing atoms. Nonstandard whitespace
+    ATOM records are accepted only with allow_whitespace_records=True.
+    Incomplete side chains are represented by zero coordinates.
     """
 
     pdb_path = Path(pdb_path)
@@ -97,16 +103,26 @@ def parse_pdb_chains(
                     f"{pdb_path.name}:{line_number}: unsupported residue {residue_name!r}"
                 )
             try:
+                if line[27:30].strip():
+                    raise ValueError("Nonstandard PDB column alignment")
                 residue_number = int(line[22:26])
-                x = float(line[30:38])
-                y = float(line[38:46])
-                z = float(line[46:54])
+                insertion_code = line[26:27]
+                x, y, z = (float(line[start:start + 8]) for start in (30, 38, 46))
                 occupancy = float(line[54:60].strip() or "0")
             except ValueError as exc:
-                raise TCRpMHCDataError(
-                    f"{pdb_path.name}:{line_number}: malformed coordinate record"
-                ) from exc
-            insertion_code = line[26:27]
+                fields = line.split()
+                residue_match = re.fullmatch(r"(-?\d+)([A-Za-z]?)", fields[5]) if len(fields) >= 10 else None
+                if (not allow_whitespace_records or residue_match is None
+                        or fields[:1] != ["ATOM"] or fields[2:5] != [atom_name, residue_name, chain]):
+                    raise TCRpMHCDataError(
+                        f"{pdb_path.name}:{line_number}: malformed coordinate record"
+                    ) from exc
+                residue_number = int(residue_match[1])
+                insertion_code = residue_match[2] or " "
+                try:
+                    x, y, z, occupancy = map(float, fields[6:10])
+                except ValueError as fallback_exc:
+                    raise TCRpMHCDataError(f"{pdb_path.name}:{line_number}: invalid whitespace ATOM record") from fallback_exc
             key = (residue_number, insertion_code)
             residue = residues[chain].setdefault(
                 key, {"name": residue_name, "atoms": {}}
@@ -133,7 +149,7 @@ def parse_pdb_chains(
         coordinate_rows: list[np.ndarray] = []
         for (residue_number, insertion_code), residue in chain_residues.items():
             atoms = residue["atoms"]
-            missing_backbone = [name for name in ("N", "CA", "C") if name not in atoms]
+            missing_backbone = [name for name in required_backbone_atoms if name not in atoms]
             if missing_backbone:
                 raise TCRpMHCDataError(
                     f"{pdb_path.name}: {chain}:{residue_number}{insertion_code.strip()} "
@@ -417,7 +433,9 @@ class EmbeddingStore:
         return torch.from_numpy(array)
 
     def __getitem__(self, sequence_or_key: str) -> torch.Tensor:
-        key = sequence_or_key if len(sequence_or_key) == 64 else sequence_key(sequence_or_key)
+        is_key = (len(sequence_or_key) == 64 and
+                  all(character in "0123456789abcdef" for character in sequence_or_key))
+        key = sequence_or_key if is_key else sequence_key(sequence_or_key)
         return self._get_cached(key)
 
     def close(self) -> None:

@@ -1,2 +1,10 @@
 data/new_structure/**/*.pdb
 data/dsmbind_tcr_pmhc/
+data/atlas_benchmark/
+data/esm_cache/
+/outputs/
+/artifacts/
+/id_ed255192026
+/id_ed255192026.pub
+__pycache__/
+*.py[cod]

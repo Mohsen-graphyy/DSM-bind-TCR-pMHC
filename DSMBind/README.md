@@ -35,3 +35,8 @@ This notebook `tutorials.ipynb` contains all the relevation information on predi
 
 This fork includes a scalable five-chain TCR-pMHC preprocessing, ESM-2 caching,
 fine-tuning, resume, and scoring pipeline. See [TCR_PMHC_FINETUNE.md](TCR_PMHC_FINETUNE.md).
+
+For portable inference on new PDBs and an ATLAS pretrained-versus-fine-tuned
+affinity ranking comparison, see [ATLAS_BENCHMARK_FA.md](ATLAS_BENCHMARK_FA.md).
+No additional training is performed; both checkpoints use the same structure
+patches and cached ESM-2 embeddings.
