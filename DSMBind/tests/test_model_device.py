@@ -60,6 +60,24 @@ class DeviceCompatibilityTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
 
+    def test_diagnostic_signal_has_same_loss_up_to_noise_constant(self):
+        from bindenergy.apps.tcr_pmhc.gradient_check import fixed_rng
+        args = Namespace(hidden_size=256, bert_size=2560, esm_size=2560,
+                         depth=1, dropout=0.1, vocab_size=63, threshold=14.0)
+        model = AllAtomEnergyModel(args).eval()
+        partner = (torch.randn(1, 3, 14, 3), torch.randn(1, 3, 2560),
+                   torch.ones(1, 3, 14, dtype=torch.long), None)
+        with fixed_rng(37):
+            ordinary = model(partner, partner)
+        with fixed_rng(37):
+            full = model(partner, partner, return_diagnostics=True)
+        with fixed_rng(37):
+            translation = model(partner, partner, return_diagnostics=True, diagnostic_translation_only=True)
+        torch.testing.assert_close(ordinary, full['loss'])
+        torch.testing.assert_close(full['loss'], full['signal_loss'] + full['zero_force_loss'])
+        torch.testing.assert_close(full['translation_loss'], translation['loss'])
+        torch.testing.assert_close(translation['loss'], translation['signal_loss'] + translation['zero_force_loss'])
+
 
 if __name__ == "__main__":
     unittest.main()

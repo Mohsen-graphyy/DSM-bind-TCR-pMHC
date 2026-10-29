@@ -157,7 +157,8 @@ class AllAtomEnergyModel(FARigidModel):
         cross = lambda a,b : torch.cross(a, b, dim=-1)
         return X + c1 * cross(w, X) + c2 * cross(w, cross(w, X))
 
-    def forward(self, binder, target, use_sidechain=True):
+    def forward(self, binder, target, use_sidechain=True, return_diagnostics=False,
+                diagnostic_translation_only=False):
         true_X, bind_S, bind_A, _ = binder
         tgt_X, tgt_S, tgt_A, _ = target
 
@@ -222,7 +223,15 @@ class AllAtomEnergyModel(FARigidModel):
 
         # Translation force
         f = torch.autograd.grad(energy.sum(), bind_X, create_graph=True, retain_graph=True)[0]
+        force_rms = f.square().mean().sqrt() if return_diagnostics else None
         t = self.mean(f[:,:,1], bind_mask)
+        if return_diagnostics and diagnostic_translation_only:
+            predicted = t * eps
+            expected = -hat_t / eps
+            return {"loss": self.mse_loss(predicted, expected),
+                    "signal_loss": (predicted.square() - 2 * predicted * expected).mean(),
+                    "zero_force_loss": expected.square().mean(), "force_rms": force_rms,
+                    "force_vector": f, "perturbed_energy": energy.mean()}
 
         # Backbone torque
         center = self.mean(bind_X[:,:,1], bind_mask)
@@ -251,7 +260,23 @@ class AllAtomEnergyModel(FARigidModel):
         score = torch.tensor([self.score[i][j] for i,j in zip(aidx, bidx)], device=device).float()
         uloss = (u - hat_u * score.unsqueeze(-1)) ** 2
         uloss = (uloss.sum(-1) * has_sc).sum() / has_sc.sum().clamp(min=1e-6)
-        return wloss + tloss + uloss * int(use_sidechain)
+        loss = wloss + tloss + uloss * int(use_sidechain)
+        if return_diagnostics:
+            # The same DSM objective with its parameter-independent noise
+            # constant removed algebraically (avoids FD cancellation in fp32).
+            wt = hat_w * torch.tensor([self.score[i][j] for i,j in zip(sidx, tidx)], device=device).float().unsqueeze(-1)
+            tt = -hat_t / eps
+            ut = hat_u * score.unsqueeze(-1)
+            sc_denominator = has_sc.sum().clamp(min=1e-6)
+            signal_w = (w.square() - 2 * w * wt).mean()
+            signal_t = ((t * eps).square() - 2 * (t * eps) * tt).mean()
+            signal_u = (((u.square() - 2 * u * ut).sum(-1)) * has_sc).sum() / sc_denominator
+            noise = wt.square().mean() + tt.square().mean() + (ut.square().sum(-1) * has_sc).sum() / sc_denominator * int(use_sidechain)
+            return {"loss": loss, "signal_loss": signal_w + signal_t + signal_u * int(use_sidechain),
+                    "zero_force_loss": noise, "rotation_loss": wloss, "translation_loss": tloss,
+                    "sidechain_loss": uloss, "force_rms": force_rms,
+                    "perturbed_energy": energy.mean()}
+        return loss
 
     def predict(self, binder, target, visual=False):
         bind_X, bind_S, bind_A, _ = binder
