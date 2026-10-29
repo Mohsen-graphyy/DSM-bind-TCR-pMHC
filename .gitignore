@@ -2,6 +2,7 @@ data/new_structure/**/*.pdb
 data/dsmbind_tcr_pmhc/
 data/atlas_benchmark/
 data/esm_cache/
+data/reference_pilot/
 /outputs/
 /artifacts/
 /id_ed255192026

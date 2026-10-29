@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chain-cache-size", type=int, default=128)
     parser.add_argument("--no-sidechain", action="store_true")
     parser.add_argument("--max-train-pairs", type=int)
+    parser.add_argument("--recurrence-backend", choices=("reference", "native"), default="reference",
+                        help="Reference fixes the observed mixed-gradient issue; native must pass the same head-gradient guard")
     return parser.parse_args()
 
 
@@ -151,6 +153,7 @@ def evaluate_loss(
     max_batches: int,
     use_sidechain: bool,
     seed: int,
+    details: dict | None = None,
 ) -> float:
     # DSM forward computes forces with autograd, so validation cannot use no_grad.
     model.eval()
@@ -160,6 +163,7 @@ def evaluate_loss(
     state_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     set_seed(seed)
     losses: list[float] = []
+    components: dict[str, list[float]] = {}
     try:
         evaluation_indices = list(range(len(dataset)))
         random.shuffle(evaluation_indices)
@@ -168,7 +172,19 @@ def evaluate_loss(
         with torch.enable_grad():
             for batch in dataset.iter_batches(batch_size, evaluation_indices):
                 binder, target = make_model_batch(batch, embeddings, device)
-                loss = model(binder, target, use_sidechain=use_sidechain)
+                if details is not None:
+                    diagnostic = model(binder, target, use_sidechain=use_sidechain, return_diagnostics=True)
+                    loss = diagnostic["loss"]
+                    for name, tensor in diagnostic.items():
+                        if tensor.numel() == 1:
+                            component = float(tensor.detach().cpu())
+                            if not math.isfinite(component):
+                                raise FloatingPointError(f"Non-finite validation diagnostic: {name}")
+                            components.setdefault(name, []).append(component)
+                    del diagnostic
+                    del tensor
+                else:
+                    loss = model(binder, target, use_sidechain=use_sidechain)
                 value = float(loss.detach().cpu())
                 if not math.isfinite(value):
                     raise FloatingPointError("Non-finite validation loss")
@@ -182,7 +198,27 @@ def evaluate_loss(
             torch.cuda.set_rng_state_all(state_cuda)
     if not losses:
         raise RuntimeError("Validation dataset produced no batches")
+    if details is not None:
+        details.update({name: float(np.mean(values)) for name, values in components.items()})
+        details.update(batches=len(losses), seed=seed, batch_size=batch_size,
+                       note="Mean batch diagnostics on a fixed validation subset/noise; no Atlas labels used")
     return float(np.mean(losses))
+
+
+def check_head_gradients(model: torch.nn.Module) -> dict:
+    """Fail before optimizer.step if any energy-head gradient is absent/non-finite."""
+    report = {}
+    for name, parameter in model.named_parameters():
+        if name.startswith(("W_o.", "U_o.")) and parameter.requires_grad:
+            gradient = parameter.grad
+            if gradient is None:
+                raise RuntimeError(f"Missing mixed gradient for {name}; refusing optimizer.step. Use --recurrence-backend reference")
+            if not bool(torch.isfinite(gradient).all()):
+                raise FloatingPointError(f"Non-finite energy-head gradient: {name}")
+            report[name] = float(gradient.detach().norm().cpu())
+    if not report or not any(value > 0 for value in report.values()):
+        raise RuntimeError("No nonzero energy-head gradient; pilot is not certified")
+    return report
 
 
 def main() -> int:
@@ -199,16 +235,24 @@ def main() -> int:
     torch.set_num_threads(args.num_threads)
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "training_config.json").write_text(
-        json.dumps({key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}, indent=2),
-        encoding="utf-8",
-    )
-
+    if not args.resume and any(args.output_dir.iterdir()):
+        raise FileExistsError("Use a new output-dir for a new run; --resume is required to continue an existing run")
     source_path = args.resume or args.init_checkpoint
     source_checkpoint = torch_load(source_path, device)
     architecture = architecture_from_checkpoint(source_checkpoint)
     model = AllAtomEnergyModel(architecture).to(device)
     model.load_state_dict(model_state_from_checkpoint(source_checkpoint), strict=True)
+
+    from .gradient_check import recurrence_backend
+    if args.recurrence_backend == "reference":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    with recurrence_backend(model, args.recurrence_backend):
+        return train_model(args, model, architecture, source_checkpoint, device)
+
+
+def train_model(args, model, architecture, source_checkpoint, device) -> int:
+    from .benchmark_io import write_json, digest_file
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.anneal_rate)
@@ -225,7 +269,10 @@ def main() -> int:
         if not isinstance(source_checkpoint, dict):
             raise ValueError("--resume requires a checkpoint created by this training script")
         saved_config = source_checkpoint.get("training_config", {})
-        for key in ("batch_size", "max_train_pairs", "no_sidechain"):
+        saved_backend = saved_config.get("recurrence_backend", "native")
+        if saved_backend != args.recurrence_backend:
+            raise ValueError("Cannot resume optimizer across recurrence backends; start afresh from the original pretrained checkpoint")
+        for key in ("batch_size", "max_train_pairs", "no_sidechain", "seed", "validation_batches"):
             if key in saved_config and saved_config[key] != getattr(args, key):
                 raise ValueError(
                     f"Cannot change {key} when resuming: checkpoint has "
@@ -272,6 +319,32 @@ def main() -> int:
         restore_rng_state(saved_rng_state)
 
     try:
+        if args.resume:
+            baseline = source_checkpoint.get("baseline_validation")
+            if not isinstance(baseline, dict):
+                raise ValueError("Resume checkpoint lacks the original fixed-noise validation baseline")
+            if digest_file(args.init_checkpoint) != baseline.get("init_checkpoint_sha256"):
+                raise ValueError("Resume requires the same original init-checkpoint as the fixed validation baseline")
+        else:
+            baseline = {}
+            print("Evaluating original checkpoint on fixed validation/noise before any update", flush=True)
+            best_validation = evaluate_loss(model, validation_data, embeddings, device, args.batch_size,
+                args.validation_batches, not args.no_sidechain, args.seed + 100_000, details=baseline)
+            baseline["init_checkpoint_sha256"] = digest_file(args.init_checkpoint)
+        write_json(args.output_dir / "training_config.json", {
+            key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()})
+        write_json(args.output_dir / "baseline_validation.json", baseline)
+        initial_state = model_state_from_checkpoint(torch_load(args.init_checkpoint, torch.device("cpu")))
+        initial_heads = {name: value.detach().cpu().clone() for name, value in initial_state.items()
+                         if name.startswith(("W_o.", "U_o."))}
+        del initial_state
+        if not args.resume:
+            initial_payload = make_checkpoint(model, optimizer, scheduler, architecture, args, best_validation,
+                0, [], {"epoch": 0, "indices": None, "next_position": 0, "running_loss": 0., "seen_batches": 0})
+            initial_payload["baseline_validation"] = baseline
+            atomic_torch_save(initial_payload, args.output_dir / "best.pt")
+            del initial_payload
+        gradient_checks = []
         for epoch in range(start_epoch, args.epochs):
             model.train()
             if epoch == start_epoch and resume_indices is not None:
@@ -307,8 +380,13 @@ def main() -> int:
                 if not math.isfinite(value):
                     raise FloatingPointError(f"Non-finite training loss at epoch {epoch + 1}")
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
+                head_gradients = check_head_gradients(model)
+                if len(gradient_checks) < 3:
+                    gradient_checks.append({"epoch": epoch, "batch": seen_batches, "norms": head_gradients})
+                    write_json(args.output_dir / "head_gradient_checks.json", gradient_checks)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm, error_if_nonfinite=True)
                 optimizer.step()
+                del loss, binder, target
                 running_loss += value
                 seen_batches += 1
                 next_position += len(batch)
@@ -325,14 +403,15 @@ def main() -> int:
                         "running_loss": running_loss,
                         "seen_batches": seen_batches,
                     }
-                    atomic_torch_save(
-                        make_checkpoint(
+                    mid_payload = make_checkpoint(
                             model, optimizer, scheduler, architecture, args,
                             best_validation, stale_epochs, history, training_state,
-                        ),
-                        args.output_dir / "last.pt",
-                    )
+                        )
+                    mid_payload["baseline_validation"] = baseline
+                    atomic_torch_save(mid_payload, args.output_dir / "last.pt")
+                    del mid_payload
 
+            validation_details = {}
             validation_loss = evaluate_loss(
                 model=model,
                 dataset=validation_data,
@@ -342,7 +421,9 @@ def main() -> int:
                 max_batches=args.validation_batches,
                 use_sidechain=not args.no_sidechain,
                 seed=args.seed + 100_000,
+                details=validation_details,
             )
+            write_json(args.output_dir / f"validation_epoch_{epoch + 1}.json", validation_details)
             scheduler.step()
             train_loss = running_loss / max(seen_batches, 1)
             history.append(
@@ -370,6 +451,7 @@ def main() -> int:
                 model, optimizer, scheduler, architecture, args,
                 best_validation, stale_epochs, history, training_state,
             )
+            payload["baseline_validation"] = baseline
             atomic_torch_save(payload, args.output_dir / "last.pt")
             if improved:
                 atomic_torch_save(payload, args.output_dir / "best.pt")
@@ -385,7 +467,17 @@ def main() -> int:
                 break
             resume_indices = None
 
-        report = {"best_validation_loss": best_validation, "epochs_completed": len(history)}
+        best_checkpoint = torch_load(args.output_dir / "best.pt", torch.device("cpu"))
+        head_updates = {name: float((best_checkpoint["model_state"][name].cpu() - value).abs().max())
+                        for name, value in initial_heads.items()}
+        last_updates = {name: float((model.state_dict()[name].detach().cpu() - value).abs().max())
+                        for name, value in initial_heads.items()}
+        report = {"best_validation_loss": best_validation, "epochs_completed": len(history),
+                  "baseline_validation_loss": baseline["loss"], "baseline_zero_force_loss": baseline["zero_force_loss"],
+                  "best_checkpoint_is_initial": not bool(best_checkpoint["history"]),
+                  "best_head_max_abs_updates": head_updates, "last_head_max_abs_updates": last_updates,
+                  "recurrence_backend": args.recurrence_backend}
+        write_json(args.output_dir / "head_updates.json", {"best": head_updates, "last": last_updates})
         if test_data is not None:
             best_checkpoint = torch_load(args.output_dir / "best.pt", device)
             model.load_state_dict(best_checkpoint["model_state"], strict=True)
