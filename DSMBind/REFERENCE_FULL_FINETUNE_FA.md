@@ -55,6 +55,24 @@ ESM_CACHE=/absolute/path/to/existing.sqlite bash scripts/train_reference_full.sh
 
 ## ۴. مشاهده روند و ادامه پس از قطع
 
+### تشخیص دستگاه واقعی SRU
+
+تابع naive در منبع upstream SRU هنگام روشن‌بودن autograd، هشدار `Running SRU on CPU with grad_enabled=True` را بدون بررسی دستگاه tensor چاپ می‌کند. این پیام به‌تنهایی نشانه انتقال به CPU نیست. مسیر reference عملیات PyTorch را روی دستگاه tensorها انجام می‌دهد؛ Python بودن حلقه با CPU بودن tensorها یکسان نیست.
+
+کد اکنون در هر فراخوانی reference دستگاه ورودی‌ها، پارامترهای مستقیم cell و خروجی‌ها را کنترل می‌کند. وقتی `--device cuda` داده شده، ورودی CPU پذیرفته نمی‌شود. در اولین فراخوانی هر cell پیام `[SRU reference verified] ... input=cuda:0 ...` چاپ می‌شود. پس از baseline، جزئیات واقعی در `outputs/.../sru_device_audit.json` ذخیره می‌شود. فقط هشدار اشتباه فوق، پس از بررسی tensorهای CUDA، فیلتر می‌شود؛ هشدار در اجرای CPU حفظ می‌شود. هیچ `.cpu()`، `.detach()` یا تغییر recurrence برای این اصلاح اضافه نشده و مسیر custom backward بومی فعال نمی‌شود.
+
+```bash
+cat outputs/reference_full_b4_01/sru_device_audit.json
+```
+
+اگر مسیر خروجی شما متفاوت است، آن را جایگزین کنید. CUDA بودن tensorها تضمین سرعت بالا نیست؛ recurrence با حلقه و autograd مرتبه دوم می‌تواند روی GPU هم کند باشد. این تغییر کنترل و گزارش دستگاه است، نه وعده افزایش سرعت. آزمون اختصاصی CUDA باید روی سرور اجرا شود؛ نسخه CPU این آزمون خودکار skip می‌شود:
+
+```bash
+PYTHONPATH=DSMBind python -m unittest discover -s DSMBind/tests -p test_reference_device.py -v
+```
+
+آزمون wrapper از recurrence آزمایشی استفاده می‌کند و جای بررسی SRU واقعی را نمی‌گیرد؛ audit زمان آموزش دستگاه SRU واقعی را گزارش می‌کند. منبع هشدار upstream: https://github.com/asappresearch/sru/blob/master/sru/ops.py
+
 ### اگر batch=1 برای مهلت شما کند است
 
 با Ctrl+C اجرای قبلی را متوقف کنید. امبدینگ‌های تکمیل‌شده حفظ می‌شوند. با batch=4 و یک epoch، همه ۱۳۷٬۸۶۳ pair استفاده می‌شوند، در ۳۴٬۴۶۶ گام optimizer. سرعت واقعی و حافظه روی GPU باید سنجیده شوند؛ افزایش batch تضمین سرعت چهاربرابری نیست. این اجرای تازه است؛ از checkpoint قبلی با batch متفاوت resume نکنید.

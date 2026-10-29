@@ -8,6 +8,7 @@ import math
 import random
 import time
 import types
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,7 @@ def fixed_rng(seed):
 
 
 @contextlib.contextmanager
-def recurrence_backend(model, backend):
+def recurrence_backend(model, backend, required_device=None, device_audit=None):
     """Temporarily select the installed SRU pure-PyTorch reference recurrence."""
     if backend == "native":
         yield 0
@@ -44,23 +45,58 @@ def recurrence_backend(model, backend):
     if backend != "reference":
         raise ValueError(backend)
     from sru.ops import elementwise_recurrence_naive
+    expected_device = torch.device(required_device) if required_device is not None else None
+    verified_cells = set()
 
     def apply_reference(cell, U, V, residual, c0, scale_val, mask_c, mask_pad):
         # grad must remain enabled: upstream naive otherwise dispatches to
         # its inference kernel, which is unsuitable for mixed derivatives.
         if not torch.is_grad_enabled():
             raise RuntimeError("Reference diagnostic requires grad_enabled=True")
-        return elementwise_recurrence_naive(
-            U, residual, V, cell.bias, c0, cell.activation_type,
-            cell.hidden_size, cell.bidirectional, cell.has_skip_term,
-            scale_val, mask_c, mask_pad,
-        )
+        actual = U.device
+        if expected_device is not None and (actual.type != expected_device.type or
+                (expected_device.index is not None and actual.index != expected_device.index)):
+            raise RuntimeError(f"SRU reference input is on {actual}; required {expected_device}. Refusing device fallback.")
+        inputs = dict(U=U, V=V, residual=residual, c0=c0, scale_val=scale_val,
+                      mask_c=mask_c, mask_pad=mask_pad)
+        for name, value in list(inputs.items()) + list(cell.named_parameters(recurse=False)):
+            if isinstance(value, torch.Tensor) and value.device != actual:
+                raise RuntimeError(f"SRU reference {name} is on {value.device}, input is on {actual}")
+        # Upstream's naive implementation warns about CPU unconditionally when
+        # grad is enabled, including with CUDA tensors. Suppress only that exact
+        # misleading warning, only after checking the CUDA tensors/parameters.
+        with warnings.catch_warnings():
+            if actual.type == "cuda":
+                warnings.filterwarnings("ignore",
+                    message=r"^Running SRU on CPU with grad_enabled=True\. Are you sure\?$",
+                    category=UserWarning, module=r"^sru\.ops$")
+            result = elementwise_recurrence_naive(
+                U, residual, V, cell.bias, c0, cell.activation_type,
+                cell.hidden_size, cell.bidirectional, cell.has_skip_term,
+                scale_val, mask_c, mask_pad,
+            )
+        if not all(isinstance(value, torch.Tensor) and value.device == actual for value in result):
+            raise RuntimeError("SRU reference output changed device; refusing device fallback")
+        if id(cell) not in verified_cells:
+            verified_cells.add(id(cell))
+            record = {"cell": cell_names[id(cell)], "input_device": str(actual),
+                      "input_devices": {name: str(value.device) for name, value in inputs.items()
+                                        if isinstance(value, torch.Tensor)},
+                      "parameter_devices": {name: str(value.device) for name, value in cell.named_parameters(recurse=False)},
+                      "output_devices": [str(value.device) for value in result],
+                      "grad_enabled": torch.is_grad_enabled(), "native_custom_backward": False}
+            if device_audit is not None:
+                device_audit.append(record)
+            print(f"[SRU reference verified] cell={record['cell']} input={actual} outputs={record['output_devices']} grad_enabled=True", flush=True)
+        return result
 
     saved = []
+    cell_names = {}
     try:
         for name, module in model.named_modules():
             if hasattr(module, "apply_recurrence") and hasattr(module, "weight_c"):
                 saved.append((module, "apply_recurrence" in module.__dict__, module.apply_recurrence))
+                cell_names[id(module)] = name
                 module.apply_recurrence = types.MethodType(apply_reference, module)
         if not saved:
             raise RuntimeError("No real SRU cells found; reference backend not installed (FakeSRU is unsupported)")

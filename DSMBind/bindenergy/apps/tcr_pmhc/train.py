@@ -249,11 +249,12 @@ def main() -> int:
     if args.recurrence_backend == "reference":
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-    with recurrence_backend(model, args.recurrence_backend):
-        return train_model(args, model, architecture, source_checkpoint, device)
+    recurrence_audit = []
+    with recurrence_backend(model, args.recurrence_backend, required_device=device, device_audit=recurrence_audit):
+        return train_model(args, model, architecture, source_checkpoint, device, recurrence_audit=recurrence_audit)
 
 
-def train_model(args, model, architecture, source_checkpoint, device) -> int:
+def train_model(args, model, architecture, source_checkpoint, device, recurrence_audit=None) -> int:
     from .benchmark_io import write_json, digest_file
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -342,6 +343,11 @@ def train_model(args, model, architecture, source_checkpoint, device) -> int:
         if args.resume and baseline.get("dataset_sha256", dataset_hashes) != dataset_hashes:
             raise ValueError("Resume requires unchanged train and validation databases")
         baseline["dataset_sha256"] = dataset_hashes
+        write_json(args.output_dir / "sru_device_audit.json", {
+            "requested_device": str(device), "backend": args.recurrence_backend,
+            "model_parameter_devices": sorted({str(p.device) for p in model.parameters()}),
+            "cells": recurrence_audit or [],
+            "note": "Actual first-call tensor devices; checked on every reference call. No CPU conversion or detach is introduced."})
         write_json(args.output_dir / "training_config.json", {
             key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()})
         write_json(args.output_dir / "baseline_validation.json", baseline)
